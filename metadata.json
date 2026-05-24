@@ -1,0 +1,6 @@
+{
+  "name": "ALEX.AI",
+  "description": "Plataforma académica inteligente, ilimitada y gratuita de alto rendimiento para resolución de tareas, estudio de documentos (PDF, DOCX, XLSX, etc.), traducción, citación APA7/Vancouver y tutoría avanzada paso a paso sin límites de créditos o membresías.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
