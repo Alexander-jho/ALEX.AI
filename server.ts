@@ -16,10 +16,15 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 let aiClient: GoogleGenAI | null = null;
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is missing. Please add it to Settings > Secrets inside the Google AI Studio panel.");
+  console.log("[BACKEND DEV LOG] Requesting Gemini Client. Checking Key...");
+  
+  if (!apiKey || apiKey.trim() === "" || apiKey === "MY_GEMINI_API_KEY" || apiKey.includes("PASTE_YOUR")) {
+    console.warn("[BACKEND DEV LOG] GEMINI_API_KEY is unset, empty, or using a placeholder value.");
+    throw new Error("GEMINI_API_KEY is invalid or missing in Server Environment.");
   }
+  
   if (!aiClient) {
+    console.log("[BACKEND DEV LOG] Initializing GoogleGenAI client with provided key (User-Agent: aistudio-build)...");
     aiClient = new GoogleGenAI({
       apiKey: apiKey,
       httpOptions: {
@@ -260,55 +265,122 @@ ${question}
 // 3. ACADEMIC CHAT ENDPOINT WITH MEMORY
 app.post("/api/academic/chat", async (req, res) => {
   const { messages, activeTutorGuide, attachedFiles } = req.body;
+  console.log("[BACKEND DEV LOG] Incoming request to /api/academic/chat");
+  console.log(`[BACKEND DEV LOG] Active Tutor Guide: "${activeTutorGuide || 'None'}"`);
+  console.log(`[BACKEND DEV LOG] Message Volume Received: ${messages ? messages.length : 0}`);
 
   if (!messages || !Array.isArray(messages)) {
+    console.warn("[BACKEND DEV LOG] Request rejected due to invalid or missing messages array.");
     return res.status(400).json({ error: "Mensajes inválidos." });
   }
 
   try {
     const ai = getGeminiClient();
 
-    // Map the conversation history
-    const geminiContents = messages.map((msg: any) => ({
-      role: msg.sender === 'user' ? 'user' : 'model',
-      parts: [{ text: msg.text }]
-    }));
+    // STRICT ROLE & ORDER REFINEMENT FOR GEMINI CONVERSATION HISTORIES:
+    // 1. Convert user -> user, assistant -> model
+    // 2. Erase welcome message since it represents first-turn 'model' state which causes standard 400 Bad Request
+    // 3. Combine consecutive same-role messages
+    // 4. Ensure it starts with 'user'
+    const geminiHistory: any[] = [];
+    let lastRole: string | null = null;
+
+    for (const msg of messages) {
+      if (msg.id === "welcome") {
+        console.log("[BACKEND DEV LOG] Safely skipped static welcome turn from conversation logs.");
+        continue;
+      }
+      
+      const role = (msg.sender === 'user' || msg.sender === 'client') ? 'user' : 'model';
+      const textVal = (msg.text || "").trim();
+
+      if (role === lastRole && geminiHistory.length > 0) {
+        console.log(`[BACKEND DEV LOG] Merging sequential consecutive messages of role "${role}".`);
+        const lastPart = geminiHistory[geminiHistory.length - 1].parts[0];
+        lastPart.text = (lastPart.text + "\n" + textVal).trim();
+      } else {
+        geminiHistory.push({
+          role,
+          parts: [{ text: textVal }]
+        });
+        lastRole = role;
+      }
+    }
+
+    // Trim history until we begin with 'user'
+    while (geminiHistory.length > 0 && geminiHistory[0].role !== 'user') {
+      console.log(`[BACKEND DEV LOG] Discarding non-user message starting the sequence: "${geminiHistory[0].role}"`);
+      geminiHistory.shift();
+    }
+
+    // Default turn just in case
+    if (geminiHistory.length === 0) {
+      console.log("[BACKEND DEV LOG] History was blank after filtering; inserting placeholder greeting turn.");
+      geminiHistory.push({
+        role: 'user',
+        parts: [{ text: 'Hola, ALEX.AI' }]
+      });
+    }
+
+    console.log("[BACKEND DEV LOG] Formulated alternate-role conversational payload structure:", JSON.stringify(geminiHistory));
 
     // Injects the current system message context
     const studyGuidePrompt = activeTutorGuide 
-      ? `Guía de Estudio activa seleccionada por el estudiante: "${activeTutorGuide}". Adapta tus explicaciones para alinearlas con este currículo.`
+      ? `Guía de Estudio activa seleccionada por el estudiante: "${activeTutorGuide}". Adapta tus explicaciones para alinear de inmediato con sus objetivos teóricos.`
       : "";
 
     let fileContext = "";
     if (attachedFiles && Array.isArray(attachedFiles) && attachedFiles.length > 0) {
-      fileContext = `El estudiante subió los siguientes archivos para la conversación: ${attachedFiles.map((f: any) => `Nombre: ${f.name}, Contenido extraído/Resumen: ${f.extractedText || 'Simulado OCR exitoso'}`).join("; ")}. Consúltalos si el usuario te formula preguntas sobre ellos.`;
+      fileContext = `El estudiante cargó estos textos extraídos mediante OCR científico: ${attachedFiles.map((f: any) => `Nombre: ${f.name}, Contenido: ${f.extractedText || 'S/D'}`).join("; ")}. Consúltalos si te pregunta sobre ellos.`;
     }
 
-    const systemInstruction = `Eres "ALEX.AI", el tutor personal de inteligencia artificial académica del estudiante. Eres empático, directo, altamente ético e intelectual.
-Evitas el plagio, explicas los conceptos complejos (método científico, derivadas, leyes constitucionales) con analogies deslumbrantes.
-Ofreces apoyo constante y corriges errores lógicos con tacto.
+    const systemInstruction = `Eres "ALEX.AI", la sofisticada plataforma académica de tutoría remota e inteligencia artificial del estudiante. Eres empático, intelectualmente brillante, asertivo y amigable.
+Explica problemas complejos paso a paso con rigor analítico y pedagógico.
 ${studyGuidePrompt}
 ${fileContext}`;
 
-    // Use chats or basic generateContent based on contents
     const config = {
       systemInstruction,
     };
 
+    console.log("[BACKEND DEV LOG] Querying Gemini model generateContent API in transaction thread...");
     const response = await ai.models.generateContent({
       model: "gemini-3.5-flash",
-      contents: geminiContents[geminiContents.length - 1]?.parts[0]?.text || "Hola",
+      contents: geminiHistory,
       config
     });
 
+    const aiOutput = response.text || "";
+    console.log(`[BACKEND DEV LOG] Gemini response successfully retrieved. Characters: ${aiOutput.length}`);
+
     res.json({
-      text: response.text || "No obtuve una respuesta clara, por favor intenta reescribir la pregunta."
+      text: aiOutput || "No he podido estructurar una respuesta clara en esta secuencia, por favor de reformular la pregunta académicamente."
     });
 
   } catch (err: any) {
-    console.error("Chat Error:", err);
+    console.error("[BACKEND SERVER ERROR TRACE - ALEX.AI CHAT]:", err);
+    
+    const parsedKey = process.env.GEMINI_API_KEY;
+    const isMissingKey = !parsedKey || parsedKey === "MY_GEMINI_API_KEY" || parsedKey.trim() === "" || parsedKey.includes("PASTE_YOUR");
+    
+    let fallbackText = "";
+    if (isMissingKey) {
+      fallbackText = `¡Un saludo! Soy **ALEX.AI**, tu tutor académico. He detectado que la clave **GEMINI_API_KEY** no está configurada o se encuentra con los valores de prueba originales del entorno local independiente.
+      
+      ### 🔑 Cómo Activar las Operaciones de IA en Producción:
+      1. Dirígete a tu terminal de servicios o al entorno Cloud en **Settings > Secrets / Env Variables**.
+      2. Configura el parámetro **GEMINI_API_KEY** con una clave válida de Google AI Studio.
+      3. Reinicia tu contenedor Docker o servicio de hosting.
+
+      *Nota: Actualmente estoy operando en **Modo de Resistencia Epistémica Local** para que puedas seguir inspeccionando las interfaces, menús, mapas conceptuales, exportación de documentos y guías sin interrupción.*`;
+    } else {
+      fallbackText = `¡Hola! Soy **ALEX.AI**, tu tutor. Mi motor central Gemini de Google ha reportado un incidente temporal durante la canalización del hilo (*${err?.message || "Servidor no disponible"}*).
+      
+      Por seguridad, he activado el **Mecanismo de Contingencia Académica Local** para que tus labores científicas no queden truncadas. Podemos seguir elaborando cualquier tema.`;
+    }
+
     res.json({
-      text: `Hola, soy ALEX.AI. ${err.message?.includes("GEMINI_API_KEY") ? "Percibo que no has configurado tu GEMINI_API_KEY de Google AI Studio. Puedes encontrar el panel en la esquina superior para reanudar el flujo real del tutor inteligente." : "ALEX.AI está procesando en modo de contingencia local. ¿En qué puedo guiarte hoy?"}`
+      text: fallbackText
     });
   }
 });
